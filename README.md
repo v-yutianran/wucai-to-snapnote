@@ -28,6 +28,18 @@ python3 backup.py
 
 真实运行会在开始备份前补推历史未同步记录，结束后提交并推送本次成功记录。没有新增记录时不会创建空提交。所有路径相对于脚本目录，不受启动目录影响。
 
+## 定时运行
+
+TaskTick 使用 [run-scheduled.zsh](run-scheduled.zsh) 作为入口，在上海时区每天每小时的 `00、15、30、45` 分运行，cron 为 `0,15,30,45 * * * *`。该入口加载现有登录 shell 环境，使用已验证的 Python 3.11，凭据仍从环境读取。
+
+可以只读检查同一入口：
+
+```zsh
+/bin/zsh /Users/xinwu/project/wucai-to-snapnote/run-scheduled.zsh --dry-run
+```
+
+任务默认不补执行、不在应用启动时执行；实际备份仍由原脚本的单机锁和来源去重保护。
+
 ## 保存内容
 
 正文只保存高亮原文和原生图片。图片通过 Snapnote 的 `resource_import` 下载到其媒体存储，再使用官方返回的 `delta_ops` 嵌入正文；图片笔记可以直接显示图片，不输出外部图片链接。批注保存到 Snapnote 原生批注，逗号分隔的五彩标签映射到原生标签，新建笔记传入五彩原始创建时间。兼容接口实际返回的 `annonation` 及文档中的 `annotation`。
