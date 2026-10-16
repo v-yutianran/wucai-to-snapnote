@@ -200,6 +200,8 @@ def fetch_highlights(call):
     while True:
         data = call({"range": "7d", "cursor": cursor, "page_size": 30})
         rows, next_cursor = data.get("highlights"), data.get("next_cursor")
+        if "highlights" in data and rows is None and next_cursor == "":
+            rows = []
         if not isinstance(rows, list) or not isinstance(next_cursor, str):
             raise BackupError("五彩高亮分页格式无效")
         for item in rows:

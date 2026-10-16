@@ -83,6 +83,15 @@ class ContentAndRecordsTests(unittest.TestCase):
 
 
 class BackupFlowTests(unittest.TestCase):
+    def test_wucai_explicit_null_highlights_are_accepted_only_on_the_terminal_page(self):
+        def pages(params):
+            return {"highlights": [{"h_id": 10}], "next_cursor": "last"} if not params["cursor"] else {
+                "highlights": None, "next_cursor": ""}
+        self.assertEqual([item["h_id"] for item in backup.fetch_highlights(pages)], [10])
+        for invalid in [{"highlights": None, "next_cursor": "not-terminal"}, {"next_cursor": ""}]:
+            with self.subTest(invalid=invalid), self.assertRaises(backup.BackupError):
+                backup.fetch_highlights(lambda _: invalid)
+
     def test_repeated_search_pages_stop_instead_of_looping(self):
         searches = 0
 
