@@ -30,7 +30,7 @@ python3 backup.py
 
 ## 定时运行
 
-TaskTick 使用 [run-scheduled.zsh](run-scheduled.zsh) 作为入口，在上海时区每天每小时的 `00、15、30、45` 分运行，cron 为 `0,15,30,45 * * * *`。该入口加载现有登录 shell 环境，使用已验证的 Python 3.11，凭据仍从环境读取。
+TaskTick 使用 [run-scheduled.zsh](run-scheduled.zsh) 作为入口，在上海时区每天每小时的 `00、15、30、45` 分运行，cron 为 `0,15,30,45 * * * *`。该入口使用非交互登录 shell 和已验证的 Python 3.11；优先沿用现有 `WUCAI_TOKEN`，缺失时仅加载 `.zshrc` 中该变量的导出行，Snapnote 沿用 `.zshenv` 的既有配置。不会加载交互式提示主题，凭据仍通过环境传给备份脚本。
 
 可以只读检查同一入口：
 
