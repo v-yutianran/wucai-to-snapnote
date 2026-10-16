@@ -56,12 +56,17 @@ def render_note(highlight, region):
             dt.datetime.fromtimestamp(highlight["created_at"], CHINA)
         except (ValueError, TypeError, OverflowError, OSError):
             raise BackupError("高亮原始时间格式无效") from None
-    return "\n".join(value for value in (values["content"], values["image_url"]) if value)
+    if values["image_url"]:
+        url = urllib.parse.urlsplit(values["image_url"])
+        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+            raise BackupError("高亮图片地址必须是 HTTP/HTTPS 地址")
+    return values["content"]
 
 
 def note_payload(highlight, region):
     text = render_note(highlight, region)
-    payload = {"body": {"delta": {"ops": [{"insert": text + "\n"}]}}, "response_mode": "minimal",
+    ops = [{"insert": text + "\n"}] if text or not highlight.get("image_url") else []
+    payload = {"body": {"delta": {"ops": ops}}, "response_mode": "minimal",
                "property_values": [{"property_name": "来源", "property_value": marker(highlight["h_id"], region)}]}
     if highlight.get("created_at") is not None:
         payload["created_at_ms"] = int(highlight["created_at"] * 1000)
@@ -113,7 +118,7 @@ def atomic_json(file, value):
 
 def backup_items(root, highlights, region, call, today):
     saved = load_records(root)
-    prepared = {normalize_id(item.get("h_id")): note_payload(item, region) for item in highlights}
+    prepared = {normalize_id(item.get("h_id")): (note_payload(item, region), item.get("image_url") or "") for item in highlights}
     stats = {"created": 0, "recovered": 0, "skipped": 0}
     pending_file = root / ".runtime/pending.json"
     if pending_file.parent.is_symlink() or pending_file.is_symlink():
@@ -124,8 +129,9 @@ def backup_items(root, highlights, region, call, today):
         uuid = pending["note_uuid"] or find_note(call, h_id, region)
         if not uuid:
             raise BackupError("待确认笔记尚未找到；请人工核对 pending.json，不会自动重建")
-        text = note_text(call, uuid)
-        if find_note(call, h_id, region) != uuid or body_digest(text) != pending["digest"]:
+        text, images = note_body(call, uuid)
+        expected_images = [pending.get("image_app_url")] if pending.get("image_required") else []
+        if find_note(call, h_id, region) != uuid or body_digest(text) != pending["digest"] or images != expected_images:
             raise BackupError("笔记读回不一致；保留 pending.json，请人工核对")
         file = root / "records" / f"{today()}.json"
         values = json.loads(file.read_text(encoding="utf-8")) if file.exists() else []
@@ -138,6 +144,7 @@ def backup_items(root, highlights, region, call, today):
             pending = json.loads(pending_file.read_text(encoding="utf-8"))
             if (not isinstance(pending, dict) or pending.get("region") != region
                     or not re.fullmatch(r"[0-9a-f]{64}", pending.get("digest", ""))
+                    or type(pending.get("image_required", False)) is not bool
                     or (pending.get("note_uuid") is not None and not isinstance(pending["note_uuid"], str))):
                 raise ValueError()
             pending["h_id"] = normalize_id(pending.get("h_id"))
@@ -149,14 +156,26 @@ def backup_items(root, highlights, region, call, today):
         else:
             pending_file.unlink()
 
-    for h_id, payload in prepared.items():
+    for h_id, (payload, image_url) in prepared.items():
         if h_id in saved:
             stats["skipped"] += 1
             continue
         existing = find_note(call, h_id, region)
-        text = payload["body"]["delta"]["ops"][0]["insert"]
-        pending = {"h_id": h_id, "region": region, "digest": body_digest(text), "note_uuid": existing}
+        text, _ = delta_parts(payload["body"]["delta"]["ops"])
+        pending = {"h_id": h_id, "region": region, "digest": body_digest(text), "note_uuid": existing,
+                   "image_required": bool(image_url)}
         atomic_json(pending_file, pending)
+        if image_url:
+            if existing:
+                _, images = note_body(call, existing)
+                if len(images) != 1:
+                    raise BackupError("已有图片笔记缺少唯一原生图片，请核对待确认项")
+                pending["image_app_url"] = images[0]
+            else:
+                imported = import_image(call, image_url)
+                pending["image_app_url"] = imported["app_url"]
+                payload["body"]["delta"]["ops"].extend(imported["delta_ops"])
+            atomic_json(pending_file, pending)
         if not existing:
             result = call("memo_create", payload)
             uuid = result.get("note_uuid")
@@ -169,20 +188,51 @@ def backup_items(root, highlights, region, call, today):
     return stats
 
 
-def note_text(call, uuid):
+def delta_parts(ops):
+    if not isinstance(ops, list):
+        raise BackupError("笔记 Delta 操作格式无效")
+    text, images = [], []
+    for op in ops:
+        value = op.get("insert") if isinstance(op, dict) else None
+        if isinstance(value, str):
+            text.append(value)
+        elif (isinstance(value, dict) and set(value) == {"image"}
+              and isinstance(value["image"], str) and value["image"].startswith("app://images/")
+              and len(value["image"]) > len("app://images/")):
+            images.append(value["image"])
+        else:
+            raise BackupError("笔记读回包含无效 Delta 或不支持的嵌入内容")
+    return "".join(text), images
+
+
+def import_image(call, image_url):
+    arguments = {"source_url": image_url, "resource_type": "image"}
+    if urllib.parse.urlsplit(image_url).hostname == "mmbiz.qpic.cn":
+        arguments["referer"] = "https://mp.weixin.qq.com/"
+    result = call("resource_import", arguments)
+    text, images = delta_parts(result.get("delta_ops"))
+    if (images != [result.get("app_url")] or text.strip() or result.get("resource_type") != "image"
+            or type(result.get("byte_size")) is not int or result["byte_size"] <= 0):
+        raise BackupError("图片导入结果缺少唯一原生图片，请核对待确认项")
+    return result
+
+
+def note_body(call, uuid):
     detail = call("memo_get", {"note_uuid": uuid, "response_mode": "editing",
                                "include_ocr": False, "include_relations": False})
     body = detail.get("item", detail.get("note_detail", detail)).get("body", {})
     if "delta" in body:
         delta = body["delta"]
         ops = delta.get("ops") if isinstance(delta, dict) else None
-        if not isinstance(ops, list) or not all(isinstance(op, dict) and isinstance(op.get("insert"), str) for op in ops):
-            raise BackupError("笔记读回包含无效 Delta 或非文本内容")
-        return "".join(op["insert"] for op in ops)
+        return delta_parts(ops)
     text = body.get("plain_text")
     if not isinstance(text, str):
         raise BackupError("笔记读回缺少完整纯文本正文")
-    return text
+    return text, []
+
+
+def note_text(call, uuid):
+    return note_body(call, uuid)[0]
 
 
 def find_note(call, h_id, region):

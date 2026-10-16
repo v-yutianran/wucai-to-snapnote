@@ -22,13 +22,17 @@ class SnapnoteMemory:
         self.captures = 0
         self.timeout_after_create = False
         self.reject_readback = False
+        self.images = {}
+        self.imports = 0
 
     def __call__(self, name, arguments):
         if name in ("memo_capture", "memo_create"):
             self.captures += 1
             uuid = f"note-{self.captures}"
             self.notes[uuid] = (arguments["text"][:500] if name == "memo_capture" else
-                                "".join(op["insert"] for op in arguments["body"]["delta"]["ops"]))
+                                "".join(op["insert"] for op in arguments["body"]["delta"]["ops"] if isinstance(op["insert"], str)))
+            self.images[uuid] = [op["insert"]["image"] for op in arguments.get("body", {}).get("delta", {}).get("ops", [])
+                                 if isinstance(op.get("insert"), dict)]
             if name == "memo_create":
                 self.sources[uuid] = arguments["property_values"][0]["property_value"]
             if self.timeout_after_create:
@@ -40,8 +44,13 @@ class SnapnoteMemory:
             text = self.notes[arguments["note_uuid"]]
             plain = "\n".join(line.strip() for line in text.splitlines())
             delta_text = plain if arguments.get("evidence_kind") == "note_body" else text
-            return {"item": {"body": {"delta": {"ops": [{"insert": delta_text + "\n"}]},
+            ops = [{"insert": delta_text + "\n"}] + [{"insert": {"image": url}} for url in self.images.get(arguments["note_uuid"], [])]
+            return {"item": {"body": {"delta": {"ops": ops},
                                       "plain_text": plain}}}
+        if name == "resource_import":
+            self.imports += 1
+            return {"resource_type": "image", "byte_size": 42, "app_url": "app://images/imported.png",
+                    "delta_ops": [{"insert": {"image": "app://images/imported.png"}}, {"insert": "\n"}]}
         if name == "memo_search":
             self.assert_search_arguments(arguments)
             matches = [{"uuid": uuid} for uuid, text in self.notes.items()
@@ -70,7 +79,7 @@ class ContentAndRecordsTests(unittest.TestCase):
         highlight = {"h_id": 123, "content": "中文 **原文**\n第二行", "annonation": "原始批注",
                      "tags": "阅读,AI", "image_url": "https://example.org/image.png", "created_at": 0}
         text = backup.render_note(highlight, "cn")
-        self.assertEqual(text, highlight["content"] + "\n" + highlight["image_url"])
+        self.assertEqual(text, highlight["content"])
         payload = backup.note_payload(highlight, "cn")
         self.assertEqual(payload["annotation"], "原始批注")
         self.assertEqual(payload["created_at_ms"], 0)
@@ -79,7 +88,7 @@ class ContentAndRecordsTests(unittest.TestCase):
         self.assertNotIn("![", text)
         highlight["annotation"] = "规范字段"
         self.assertEqual(backup.note_payload(highlight, "cn")["annotation"], "规范字段")
-        self.assertEqual(backup.render_note({"h_id": 4, "image_url": "https://example.org/p.png"}, "cn"), "https://example.org/p.png")
+        self.assertEqual(backup.render_note({"h_id": 4, "image_url": "https://example.org/p.png"}, "cn"), "")
         self.assertEqual(backup.render_note({"h_id": 5, "content": "只有原文"}, "cn"), "只有原文")
         for invalid in [False, 0, [], {}]:
             with self.subTest(invalid=invalid), self.assertRaises(backup.BackupError):
@@ -99,6 +108,47 @@ class ContentAndRecordsTests(unittest.TestCase):
 
 
 class BackupFlowTests(unittest.TestCase):
+    def test_empty_import_or_missing_saved_image_never_records_success(self):
+        for failure in ("empty_import", "missing_embed"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root, remote = Path(directory), SnapnoteMemory()
+
+                def call(name, arguments):
+                    result = remote(name, arguments)
+                    if name == "resource_import" and failure == "empty_import":
+                        result["byte_size"] = 0
+                    if name == "memo_get" and failure == "missing_embed":
+                        body = result["item"]["body"]
+                        body["delta"]["ops"] = [op for op in body["delta"]["ops"] if isinstance(op["insert"], str)]
+                    return result
+
+                with self.assertRaises(backup.BackupError):
+                    backup.backup_items(root, [{"h_id": 9, "content": "图片说明", "image_url": "https://example.org/photo.png"}], "cn", call, lambda: "2026-10-16")
+                self.assertEqual(backup.load_records(root), set())
+                self.assertTrue((root / ".runtime/pending.json").exists())
+                self.assertEqual(remote.captures, 0 if failure == "empty_import" else 1)
+
+    def test_image_is_imported_and_embedded_and_lost_create_ack_does_not_duplicate_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, remote = Path(directory), SnapnoteMemory()
+            saved_ops = []
+
+            def call(name, arguments):
+                if name == "memo_create":
+                    saved_ops.extend(arguments["body"]["delta"]["ops"])
+                return remote(name, arguments)
+
+            remote.timeout_after_create = True
+            with self.assertRaises(backup.BackupError):
+                backup.backup_items(root, [{"h_id": 9, "image_url": "https://example.org/photo.png"}], "cn", call, lambda: "2026-10-16")
+            self.assertEqual(remote.imports, 1)
+            self.assertEqual(saved_ops[0]["insert"], {"image": "app://images/imported.png"})
+            self.assertEqual(remote.images["note-1"], ["app://images/imported.png"])
+            self.assertEqual(backup.load_records(root), set())
+            backup.backup_items(root, [], "cn", remote, lambda: "2026-10-16")
+            self.assertEqual((remote.imports, remote.captures), (1, 1))
+            self.assertEqual(backup.load_records(root), {"9"})
+
     def test_source_schema_dry_run_does_not_create_and_existing_conflicts_stop(self):
         definitions, creates = [], []
 
@@ -412,7 +462,7 @@ class GitSyncTests(unittest.TestCase):
         script = Path(self.temporary.name) / "fake_skill.py"
         script.write_text("import json,sys,os\np=json.load(sys.stdin)\nassert os.environ['WUCAI_API_TOKEN']=='wct-synthetic-token'\n"
                           "data={'highlights':[{'h_id':1,'content':'合成正文'}],'next_cursor':'next'} if not p['cursor'] else "
-                          "{'highlights':[{'h_id':1},{'h_id':2,'annonation':'合成批注'}],'next_cursor':''}\n"
+                          "{'highlights':[{'h_id':1},{'h_id':2,'annonation':'合成批注','image_url':'https://example.org/photo.png'}],'next_cursor':''}\n"
                           "print(json.dumps({'code':1,'data':data}))\n")
         env = {"WUCAI_TOKEN": "wct-synthetic-token", "SNAPNOTE_MCP_TOKEN": "synthetic-snapnote-token",
                "SNAPNOTE_MCP_URL": f"http://127.0.0.1:{server.server_port}/mcp"}
@@ -422,17 +472,20 @@ class GitSyncTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 self.assertEqual(backup.main(["--dry-run"], root=self.root), 0)
             self.assertEqual(remote.captures, 0)
+            self.assertEqual(remote.imports, 0)
             self.assertFalse((self.root / ".runtime").exists())
             self.assertFalse((self.root / "records").exists())
             self.assertEqual(self.command(self.root, "git", "rev-parse", "HEAD"), head)
             with contextlib.redirect_stdout(output):
                 self.assertEqual(backup.main([], root=self.root), 0)
             self.assertEqual(remote.captures, 2)
+            self.assertEqual(remote.imports, 1)
             self.assertEqual(backup.load_records(self.root), {"1", "2"})
             synced_head = self.command(self.root, "git", "rev-parse", "HEAD")
             with contextlib.redirect_stdout(output):
                 self.assertEqual(backup.main([], root=self.root), 0)
             self.assertEqual(remote.captures, 2)
+            self.assertEqual(remote.imports, 1)
             self.assertEqual(self.command(self.root, "git", "rev-parse", "HEAD"), synced_head)
             self.assertNotIn("wct-synthetic-token", output.getvalue())
             self.assertNotIn("synthetic-snapnote-token", output.getvalue())
