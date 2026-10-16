@@ -160,7 +160,7 @@ def backup_items(root, highlights, region, call, today):
 def note_text(call, uuid):
     detail = call("memo_get", {"note_uuid": uuid, "response_mode": "readable", "evidence_kind": "note_body",
                                "include_ocr": False, "include_relations": False})
-    body = detail.get("note_detail", detail).get("body", {})
+    body = detail.get("item", detail.get("note_detail", detail)).get("body", {})
     text = body.get("plain_text")
     if not isinstance(text, str):
         raise BackupError("笔记读回缺少完整纯文本正文")

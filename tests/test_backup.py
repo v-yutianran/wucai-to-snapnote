@@ -33,7 +33,7 @@ class SnapnoteMemory:
         if name == "memo_get":
             if self.reject_readback:
                 raise backup.BackupError("模拟读回失败")
-            return {"note_detail": {"body": {"plain_text": self.notes[arguments["note_uuid"]]}}}
+            return {"item": {"body": {"plain_text": self.notes[arguments["note_uuid"]]}}}
         if name == "memo_search":
             self.assert_search_arguments(arguments)
             matches = [{"uuid": uuid} for uuid, text in self.notes.items() if arguments["query"] in text]
@@ -83,6 +83,11 @@ class ContentAndRecordsTests(unittest.TestCase):
 
 
 class BackupFlowTests(unittest.TestCase):
+    def test_note_readback_accepts_the_live_item_envelope(self):
+        text = backup.render_note({"h_id": 1, "content": "完整正文"}, "cn")
+        response = {"item": {"body": {"plain_text": text}}, "count": 1, "note_uuid": "note-1"}
+        self.assertEqual(backup.note_text(lambda name, arguments: response, "note-1"), text)
+
     def test_wucai_explicit_null_highlights_are_accepted_only_on_the_terminal_page(self):
         def pages(params):
             return {"highlights": [{"h_id": 10}], "next_cursor": "last"} if not params["cursor"] else {
