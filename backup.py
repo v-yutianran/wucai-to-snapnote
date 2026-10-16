@@ -146,7 +146,8 @@ def backup_items(root, highlights, region, call, today):
         pending = {"h_id": h_id, "region": region, "digest": body_digest(text), "note_uuid": existing}
         atomic_json(pending_file, pending)
         if not existing:
-            result = call("memo_capture", {"text": text, "response_mode": "minimal"})
+            result = call("memo_create", {"body": {"delta": {"ops": [{"insert": text + "\n"}]}},
+                                          "response_mode": "minimal"})
             uuid = result.get("note_uuid")
             if not isinstance(uuid, str) or not uuid.strip():
                 raise BackupError("创建结果没有有效 note_uuid；保留 pending.json，请人工核对")
@@ -158,9 +159,15 @@ def backup_items(root, highlights, region, call, today):
 
 
 def note_text(call, uuid):
-    detail = call("memo_get", {"note_uuid": uuid, "response_mode": "readable", "evidence_kind": "note_body",
+    detail = call("memo_get", {"note_uuid": uuid, "response_mode": "editing",
                                "include_ocr": False, "include_relations": False})
     body = detail.get("item", detail.get("note_detail", detail)).get("body", {})
+    if "delta" in body:
+        delta = body["delta"]
+        ops = delta.get("ops") if isinstance(delta, dict) else None
+        if not isinstance(ops, list) or not all(isinstance(op, dict) and isinstance(op.get("insert"), str) for op in ops):
+            raise BackupError("笔记读回包含无效 Delta 或非文本内容")
+        return "".join(op["insert"] for op in ops)
     text = body.get("plain_text")
     if not isinstance(text, str):
         raise BackupError("笔记读回缺少完整纯文本正文")

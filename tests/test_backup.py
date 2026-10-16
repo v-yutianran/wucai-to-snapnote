@@ -23,17 +23,22 @@ class SnapnoteMemory:
         self.reject_readback = False
 
     def __call__(self, name, arguments):
-        if name == "memo_capture":
+        if name in ("memo_capture", "memo_create"):
             self.captures += 1
             uuid = f"note-{self.captures}"
-            self.notes[uuid] = arguments["text"]
+            self.notes[uuid] = (arguments["text"][:500] if name == "memo_capture" else
+                                "".join(op["insert"] for op in arguments["body"]["delta"]["ops"]))
             if self.timeout_after_create:
                 raise backup.BackupError("模拟：服务已创建，但响应丢失")
             return {"note_uuid": uuid}
         if name == "memo_get":
             if self.reject_readback:
                 raise backup.BackupError("模拟读回失败")
-            return {"item": {"body": {"plain_text": self.notes[arguments["note_uuid"]]}}}
+            text = self.notes[arguments["note_uuid"]]
+            plain = "\n".join(line.strip() for line in text.splitlines())
+            delta_text = plain if arguments.get("evidence_kind") == "note_body" else text
+            return {"item": {"body": {"delta": {"ops": [{"insert": delta_text + "\n"}]},
+                                      "plain_text": plain}}}
         if name == "memo_search":
             self.assert_search_arguments(arguments)
             matches = [{"uuid": uuid} for uuid, text in self.notes.items() if arguments["query"] in text]
@@ -83,6 +88,15 @@ class ContentAndRecordsTests(unittest.TestCase):
 
 
 class BackupFlowTests(unittest.TestCase):
+    def test_long_notes_preserve_full_text_and_line_edge_spaces_through_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, remote = Path(directory), SnapnoteMemory()
+            highlight = {"h_id": 1, "content": "  保留前后空格  \n" + "长原文" * 300}
+            backup.backup_items(root, [highlight], "cn", remote, lambda: "2026-10-16")
+            expected = backup.render_note(highlight, "cn")
+            self.assertEqual(backup.note_text(remote, "note-1").rstrip("\n"), expected)
+            self.assertEqual(backup.load_records(root), {"1"})
+
     def test_note_readback_accepts_the_live_item_envelope(self):
         text = backup.render_note({"h_id": 1, "content": "完整正文"}, "cn")
         response = {"item": {"body": {"plain_text": text}}, "count": 1, "note_uuid": "note-1"}
