@@ -299,6 +299,26 @@ class GitSyncTests(unittest.TestCase):
         with self.assertRaises(backup.BackupError):
             backup.git_preflight(self.root, str(self.remote))
 
+    def test_github_https_rewritten_to_ssh_keeps_the_same_repository_identity(self):
+        original_git = backup.git
+        actual_url = "git@github.com:v-yutianran/wucai-to-snapnote.git"
+
+        def rewritten_git(root, *arguments):
+            if arguments in [("remote", "get-url", "origin"), ("remote", "get-url", "--push", "--all", "origin")]:
+                return actual_url
+            return original_git(root, *arguments)
+
+        with patch("backup.git", side_effect=rewritten_git):
+            self.assertTrue(backup.git_preflight(self.root))
+            actual_url = "git@github.com:another-owner/wucai-to-snapnote.git"
+            with self.assertRaises(backup.BackupError):
+                backup.git_preflight(self.root)
+
+    def test_separate_push_destination_must_match_the_authorized_repository(self):
+        self.command(self.root, "git", "config", "remote.origin.pushurl", str(self.root / "another-remote.git"))
+        with self.assertRaises(backup.BackupError):
+            backup.git_preflight(self.root, str(self.remote))
+
     def test_record_deletion_is_blocked(self):
         file = self.root / "records/2026-10-16.json"
         backup.atomic_json(file, ["1"])

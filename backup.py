@@ -289,7 +289,13 @@ def git_preflight(root, expected_remote=REMOTE):
         raise BackupError("当前目录不是独立备份仓库")
     if git(root, "branch", "--show-current") != "main":
         raise BackupError("请在 main 分支运行")
-    if git(root, "remote", "get-url", "origin") != expected_remote:
+    allowed = {expected_remote}
+    if expected_remote.startswith("https://github.com/"):
+        repository = expected_remote.removeprefix("https://github.com/")
+        allowed.update({f"git@github.com:{repository}", f"ssh://git@github.com/{repository}"})
+    push_urls = git(root, "remote", "get-url", "--push", "--all", "origin").splitlines()
+    if (git(root, "remote", "get-url", "origin") not in allowed
+            or len(push_urls) != 1 or push_urls[0] not in allowed):
         raise BackupError("origin 不匹配已授权的备份仓库")
     changed_records(root)
     load_records(root)

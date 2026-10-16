@@ -65,7 +65,7 @@ JSON 是 `h_id` 字符串数组。使用字符串保留 64 位整数精度，示
 
 ## Git 同步
 
-目标固定为私有仓库 `v-yutianran/wucai-to-snapnote`，分支 `main`，origin 使用 HTTPS Git 地址。运行中只精确提交 `records/YYYY-MM-DD.json`。
+目标固定为私有仓库 `v-yutianran/wucai-to-snapnote`，分支 `main`；接受同一仓库的 GitHub HTTPS/SSH 地址，包括本机 `insteadOf` 的协议重写。运行中只精确提交 `records/YYYY-MM-DD.json`。
 
 存在其他文件改动、未推送的代码提交、记录删除、合并提交或远端分支不再是本地祖先时，程序停止，交由你处理。程序不会自动拉取、合并、rebase 或强推。需要更新代码时先手工同步，使工作区干净。
 
