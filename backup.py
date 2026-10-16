@@ -42,7 +42,7 @@ def body_digest(text):
 
 
 def render_note(highlight, region):
-    h_id = normalize_id(highlight.get("h_id"))
+    normalize_id(highlight.get("h_id"))
     values = {}
     for key in ("content", "annotation", "annonation", "tags", "image_url"):
         value = highlight.get(key)
@@ -51,16 +51,27 @@ def render_note(highlight, region):
         if not isinstance(value, str):
             raise BackupError("高亮文本字段格式无效")
         values[key] = value
-    created = "未提供"
     if highlight.get("created_at") is not None:
         try:
-            created = dt.datetime.fromtimestamp(highlight["created_at"], CHINA).strftime("%Y-%m-%d %H:%M:%S %z")
+            dt.datetime.fromtimestamp(highlight["created_at"], CHINA)
         except (ValueError, TypeError, OverflowError, OSError):
             raise BackupError("高亮原始时间格式无效") from None
-    return (f"五彩高亮 · {h_id}\n\n原文：\n{values['content']}\n\n"
-            f"批注：\n{values['annotation'] or values['annonation']}\n\n"
-            f"原始时间：{created}\n标签：{values['tags']}\n图片链接：{values['image_url']}\n"
-            f"来源：五彩 {region}\n{marker(h_id, region)}")
+    return "\n".join(value for value in (values["content"], values["image_url"]) if value)
+
+
+def note_payload(highlight, region):
+    text = render_note(highlight, region)
+    payload = {"body": {"delta": {"ops": [{"insert": text + "\n"}]}}, "response_mode": "minimal",
+               "property_values": [{"property_name": "来源", "property_value": marker(highlight["h_id"], region)}]}
+    if highlight.get("created_at") is not None:
+        payload["created_at_ms"] = int(highlight["created_at"] * 1000)
+    annotation = highlight.get("annotation") or highlight.get("annonation")
+    if annotation:
+        payload["annotation"] = annotation
+    tags = list(dict.fromkeys(tag.strip() for tag in (highlight.get("tags") or "").split(",") if tag.strip()))
+    if tags:
+        payload["tag_names"] = tags
+    return payload
 
 
 def load_records(root):
@@ -102,7 +113,7 @@ def atomic_json(file, value):
 
 def backup_items(root, highlights, region, call, today):
     saved = load_records(root)
-    prepared = {normalize_id(item.get("h_id")): render_note(item, region) for item in highlights}
+    prepared = {normalize_id(item.get("h_id")): note_payload(item, region) for item in highlights}
     stats = {"created": 0, "recovered": 0, "skipped": 0}
     pending_file = root / ".runtime/pending.json"
     if pending_file.parent.is_symlink() or pending_file.is_symlink():
@@ -114,7 +125,7 @@ def backup_items(root, highlights, region, call, today):
         if not uuid:
             raise BackupError("待确认笔记尚未找到；请人工核对 pending.json，不会自动重建")
         text = note_text(call, uuid)
-        if marker(h_id, region) not in text.splitlines() or body_digest(text) != pending["digest"]:
+        if find_note(call, h_id, region) != uuid or body_digest(text) != pending["digest"]:
             raise BackupError("笔记读回不一致；保留 pending.json，请人工核对")
         file = root / "records" / f"{today()}.json"
         values = json.loads(file.read_text(encoding="utf-8")) if file.exists() else []
@@ -138,16 +149,16 @@ def backup_items(root, highlights, region, call, today):
         else:
             pending_file.unlink()
 
-    for h_id, text in prepared.items():
+    for h_id, payload in prepared.items():
         if h_id in saved:
             stats["skipped"] += 1
             continue
         existing = find_note(call, h_id, region)
+        text = payload["body"]["delta"]["ops"][0]["insert"]
         pending = {"h_id": h_id, "region": region, "digest": body_digest(text), "note_uuid": existing}
         atomic_json(pending_file, pending)
         if not existing:
-            result = call("memo_create", {"body": {"delta": {"ops": [{"insert": text + "\n"}]}},
-                                          "response_mode": "minimal"})
+            result = call("memo_create", payload)
             uuid = result.get("note_uuid")
             if not isinstance(uuid, str) or not uuid.strip():
                 raise BackupError("创建结果没有有效 note_uuid；保留 pending.json，请人工核对")
@@ -176,30 +187,48 @@ def note_text(call, uuid):
 
 def find_note(call, h_id, region):
     query = marker(h_id, region)
-    matches, seen, offset = set(), set(), 0
-    while True:
-        result = call("memo_search", {"query": query, "include_archived": True,
-                                      "offset": offset, "limit": 20, "response_mode": "compact"})
-        items = result.get("items")
-        if not isinstance(items, list) or type(result.get("has_more")) is not bool:
-            raise BackupError("Snapnote 搜索分页格式无效")
-        new_items = set()
-        for item in items:
-            uuid = item.get("uuid")
-            if not isinstance(uuid, str) or not uuid:
-                raise BackupError("搜索结果缺少笔记 UUID")
-            new_items.add(uuid)
-            if query in note_text(call, uuid).splitlines():
-                matches.add(uuid)
-        if not result["has_more"]:
-            break
-        if not new_items - seen:
-            raise BackupError("Snapnote 搜索分页未推进")
-        seen.update(new_items)
-        offset += len(items)
+    matches = set()
+    # 旧正文标识只用于兼容已创建笔记；新笔记通过原生来源属性检索。
+    for filters in [{"property_filters": [{"property_name": "来源", "property_value": query}]}, {"query": query}]:
+        seen, offset = set(), 0
+        while True:
+            result = call("memo_search", dict(filters, include_archived=True,
+                                              offset=offset, limit=20, response_mode="compact"))
+            items = result.get("items")
+            if not isinstance(items, list) or type(result.get("has_more")) is not bool:
+                raise BackupError("Snapnote 搜索分页格式无效")
+            new_items = set()
+            for item in items:
+                uuid = item.get("uuid")
+                if not isinstance(uuid, str) or not uuid:
+                    raise BackupError("搜索结果缺少笔记 UUID")
+                new_items.add(uuid)
+                if "property_filters" in filters or query in note_text(call, uuid).splitlines():
+                    matches.add(uuid)
+            if not result["has_more"]:
+                break
+            if not new_items - seen:
+                raise BackupError("Snapnote 搜索分页未推进")
+            seen.update(new_items)
+            offset += len(items)
     if len(matches) > 1:
         raise BackupError("同一 h_id 匹配多篇笔记，请人工核对")
     return next(iter(matches), None)
+
+
+def ensure_source_property(call, dry_run):
+    items = call("property_definitions", {}).get("items")
+    if not isinstance(items, list):
+        raise BackupError("Snapnote 属性定义格式无效")
+    matches = [item for item in items if item.get("name") == "来源"]
+    if len(matches) > 1 or (matches and matches[0].get("type") != "text"):
+        raise BackupError("来源属性同名或类型冲突，请人工核对")
+    if not matches and not dry_run:
+        result = call("property_create", {"name": "来源", "type": "text"})
+        definition = result.get("property_definition", {})
+        if definition.get("name") != "来源" or definition.get("type") != "text":
+            raise BackupError("来源属性创建结果不明，请核对后再运行")
+    return not matches
 
 
 def fetch_highlights(call):
@@ -398,14 +427,16 @@ def main(argv=None, root=None):
             profile = call("service_profile", {})
             if profile.get("service_key") != "snapnote.data_source" or profile.get("service_version") != "v1alpha1":
                 raise BackupError("Snapnote 服务契约不匹配，本脚本仅支持 v1alpha1 JSON HTTP 接口")
+            property_missing = ensure_source_property(call, args.dry_run)
             highlights = fetch_highlights(lambda params: skill_page(params, wucai, SKILL_SCRIPT))
             # 在任何创建请求之前校验本次全部正文，避免坏数据导致部分写入。
             for item in highlights:
-                render_note(item, "cn")
+                note_payload(item, "cn")
             if args.dry_run:
                 event("backup.preview", source_count=len(highlights),
                       unrecorded_count=sum(normalize_id(item["h_id"]) not in saved for item in highlights),
                       pending_confirmation=(root / ".runtime/pending.json").exists(),
+                      source_property_missing=property_missing,
                       git_sync_needed=bool(changed_records(root)) or git(root, "rev-parse", "HEAD") != remote)
                 return 0
             event("backup.started", source_count=len(highlights))

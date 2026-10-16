@@ -18,6 +18,7 @@ class SnapnoteMemory:
 
     def __init__(self):
         self.notes = {}
+        self.sources = {}
         self.captures = 0
         self.timeout_after_create = False
         self.reject_readback = False
@@ -28,6 +29,8 @@ class SnapnoteMemory:
             uuid = f"note-{self.captures}"
             self.notes[uuid] = (arguments["text"][:500] if name == "memo_capture" else
                                 "".join(op["insert"] for op in arguments["body"]["delta"]["ops"]))
+            if name == "memo_create":
+                self.sources[uuid] = arguments["property_values"][0]["property_value"]
             if self.timeout_after_create:
                 raise backup.BackupError("模拟：服务已创建，但响应丢失")
             return {"note_uuid": uuid}
@@ -41,9 +44,13 @@ class SnapnoteMemory:
                                       "plain_text": plain}}}
         if name == "memo_search":
             self.assert_search_arguments(arguments)
-            matches = [{"uuid": uuid} for uuid, text in self.notes.items() if arguments["query"] in text]
+            matches = [{"uuid": uuid} for uuid, text in self.notes.items()
+                       if (self.sources.get(uuid) == arguments["property_filters"][0]["property_value"]
+                           if "property_filters" in arguments else arguments["query"] in text)]
             offset = arguments["offset"]
             return {"items": matches[offset:offset + 20], "has_more": offset + 20 < len(matches)}
+        if name == "property_definitions":
+            return {"items": [{"uuid": "source", "name": "来源", "type": "text"}]}
         raise AssertionError(name)
 
     @staticmethod
@@ -63,13 +70,17 @@ class ContentAndRecordsTests(unittest.TestCase):
         highlight = {"h_id": 123, "content": "中文 **原文**\n第二行", "annonation": "原始批注",
                      "tags": "阅读,AI", "image_url": "https://example.org/image.png", "created_at": 0}
         text = backup.render_note(highlight, "cn")
-        for expected in [highlight["content"], "原始批注", "阅读,AI", highlight["image_url"],
-                         "[wucai:cn:h_id:123]", "1970-01-01 08:00:00"]:
-            self.assertIn(expected, text)
+        self.assertEqual(text, highlight["content"] + "\n" + highlight["image_url"])
+        payload = backup.note_payload(highlight, "cn")
+        self.assertEqual(payload["annotation"], "原始批注")
+        self.assertEqual(payload["created_at_ms"], 0)
+        self.assertEqual(payload["tag_names"], ["阅读", "AI"])
+        self.assertEqual(payload["property_values"], [{"property_name": "来源", "property_value": backup.marker("123", "cn")}])
         self.assertNotIn("![", text)
         highlight["annotation"] = "规范字段"
-        self.assertIn("规范字段", backup.render_note(highlight, "cn"))
-        self.assertIn("图片链接", backup.render_note({"h_id": 4, "image_url": "https://example.org/p.png"}, "cn"))
+        self.assertEqual(backup.note_payload(highlight, "cn")["annotation"], "规范字段")
+        self.assertEqual(backup.render_note({"h_id": 4, "image_url": "https://example.org/p.png"}, "cn"), "https://example.org/p.png")
+        self.assertEqual(backup.render_note({"h_id": 5, "content": "只有原文"}, "cn"), "只有原文")
         for invalid in [False, 0, [], {}]:
             with self.subTest(invalid=invalid), self.assertRaises(backup.BackupError):
                 backup.render_note({"h_id": 4, "content": invalid}, "cn")
@@ -88,6 +99,25 @@ class ContentAndRecordsTests(unittest.TestCase):
 
 
 class BackupFlowTests(unittest.TestCase):
+    def test_source_schema_dry_run_does_not_create_and_existing_conflicts_stop(self):
+        definitions, creates = [], []
+
+        def call(name, arguments):
+            if name == "property_definitions":
+                return {"items": definitions}
+            creates.append(arguments)
+            definitions.append(dict(arguments, uuid="source"))
+            return {"property_definition": definitions[0]}
+
+        self.assertTrue(backup.ensure_source_property(call, True))
+        self.assertEqual(creates, [])
+        backup.ensure_source_property(call, False)
+        self.assertFalse(backup.ensure_source_property(call, False))
+        self.assertEqual(creates, [{"name": "来源", "type": "text"}])
+        definitions[0]["type"] = "number"
+        with self.assertRaises(backup.BackupError):
+            backup.ensure_source_property(call, False)
+
     def test_long_notes_preserve_full_text_and_line_edge_spaces_through_delta(self):
         with tempfile.TemporaryDirectory() as directory:
             root, remote = Path(directory), SnapnoteMemory()
